@@ -1,32 +1,25 @@
 #-*- coding: utf-8 -*-
 '''
-Created on 6 de fev de 2017
+Created on 29 de fev de 2017
 
 @author: gusta
 '''
+
 from ferramentas.Janela_deslizante import Janela
 from ferramentas.Importar_dataset import Datasets
 from ferramentas.Particionar_series import Particionar_series
 from metricas.Metricas_deteccao import Metricas_deteccao
+from detectores.DDM import DDM
+from regressores.ELM import ELMRegressor
 from graficos.Graficos_execucao import Grafico
-from regressores.IDPSO_ELM import IDPSO_ELM
-from detectores.B import B
 from sklearn.metrics.regression import mean_absolute_error
 import time
+import numpy as np
 
-
-#parametros IDPSO
-it = 50
-inercia_inicial = 0.8
-inercia_final = 0.4
-xmax = 1
-c1 = 2
-c2 = 2
-crit_parada = 2
 divisao_dataset = [0.8, 0.2, 0]
 
-class IDPSO_ELM_B():
-    def __init__(self, dataset, n, lags, qtd_neuronios, numero_particulas, limite, w, c):
+class ELM_DDM():
+    def __init__(self, dataset, n, lags, qtd_neuronios, w, c):
         '''
         construtor do algoritmo que detecta a mudanca de ambiente por meio do comportamento das particulas
         :param dataset: serie temporal que o algoritmo vai executar
@@ -35,8 +28,6 @@ class IDPSO_ELM_B():
         :param n: tamanho do n para reavaliar o metodo de deteccao
         :param lags: quantidade de lags para modelar as entradas da RNA
         :param qtd_neuronios: quantidade de neuronios escondidos da RNA
-        :param numero_particulas: numero de particulas para serem usadas no IDPSO
-        :param n_particulas_comportamento: numero de particulas para serem monitoradas na detecccao de mudanca
         :param limite: contador para verificar a mudanca
         '''
         
@@ -44,11 +35,32 @@ class IDPSO_ELM_B():
         self.n = n
         self.lags = lags
         self.qtd_neuronios = qtd_neuronios
-        self.numero_particulas = numero_particulas
         
-        self.limite = limite
         self.w = w
         self.c = c
+    
+    def Computar_estatisticas_DDM_desvio(self, vetor_caracteristicas, lags, ELM):
+        '''
+        Metodo para computar a deteccao de mudanca do erro por meio do DDM com desvio padrão tradicional
+        :param vetor_caracteristicas: vetor com uma amostra da serie temporal que sera avaliada para verificar a mudanca
+        :param lags: quantidade de lags para modelar as entradas da RNA
+        :param enxame: enxame utilizado para verificar a mudanca
+        :return: retorna a media ou o comportamento do enxame em relacao ao vetor de caracteristicas
+        '''
+        #particionando o vetor de caracteristicas para usar para treinar 
+        particao = Particionar_series(vetor_caracteristicas, divisao_dataset, lags)
+        [caracteristicas_entrada, caracteristicas_saida] = particao.Part_train()
+        
+        #realizando as previsoes e armazenando as acuracias 
+        predicao_caracteristica = ELM.Predizer(caracteristicas_entrada)
+        
+        erros = []
+        
+        for i in range(len(caracteristicas_saida)):
+            erro = mean_absolute_error(caracteristicas_saida[i:i+1], predicao_caracteristica[i:i+1])
+            erros.append(erro)
+            
+        return np.min(erros), np.std(erros), erros
     
     def Executar(self, grafico = None):
         '''
@@ -56,38 +68,37 @@ class IDPSO_ELM_B():
         :param grafico: variavel booleana para ativar ou desativar o grafico
         :return: retorna 5 variaveis: [falsos_alarmes, atrasos, falta_deteccao, MAPE, tempo_execucao]
         '''
-        
-        
-        
+
         ################################################################################################################################################
         ################################# CONFIGURACAO DO DATASET ######################################################################################
         ################################################################################################################################################
         
-        #dividindo os dados da dataset dinamica para treinamento_inicial inicial e para uso do stream dinâmico
-        treinamento_inicial = self.dataset[0:self.n]
-        stream = self.dataset[self.n:]
-        
+        #dividindo os dados da dataset dinamica para treinamento_inicial inicial e para uso do stream din�mico
+        treinamento_inicial = self.dataset[0:self.n]        stream = self.dataset[self.n:]
+    
         ################################################################################################################################################
         ################################# PERIODO ESTATICO #############################################################################################
         ################################################################################################################################################
         
-        #criando e treinando um enxame_vigente para realizar as previsões
-        enxame = IDPSO_ELM(treinamento_inicial, divisao_dataset, self.lags, self.qtd_neuronios)
-        enxame.Parametros_IDPSO(it, self.numero_particulas, inercia_inicial, inercia_final, c1, c2, xmax, crit_parada)
-        enxame.Treinar()  
-       
+        #criando e treinando um enxame_vigente para realizar as previsoes
+        ELM = ELMRegressor(self.qtd_neuronios)
+        ELM.Tratamento_dados(treinamento_inicial, divisao_dataset, self.lags)
+        ELM.Treinar(ELM.train_entradas, ELM.train_saidas)
+        
         #ajustando com os dados finais do treinamento a janela de predicao
         janela_predicao = Janela()
-        janela_predicao.Ajustar(enxame.dataset[0][(len(enxame.dataset[0])-1):])
-        predicao = enxame.Predizer(janela_predicao.dados)
+        janela_predicao.Ajustar(ELM.train_entradas[len(ELM.train_entradas)-1:])
+        predicao = ELM.Predizer(janela_predicao.dados)
         
         #janela com o atual conceito, tambem utilizada para armazenar os dados de retreinamento
         janela_caracteristicas = Janela()
         janela_caracteristicas.Ajustar(treinamento_inicial)
         
-        #ativando o sensor de comportamento de acordo com a primeira janela de caracteristicas para media e desvio padrão
-        b = B(self.limite, self.w, self.c)        b.armazenar_conceito(janela_caracteristicas.dados, self.lags, enxame)
-
+        #atualizar por ECDD
+        [erro_min, desvio_min, erros] = self.Computar_estatisticas_DDM_desvio(janela_caracteristicas.dados, self.lags, ELM)
+        ddm = DDM(self.w, self.c)
+        ddm.armazenar_conceito(erro_min, desvio_min, erros)
+        
         ################################################################################################################################################
         ################################# PERIODO DINAMICO #############################################################################################
         ################################################################################################################################################
@@ -105,78 +116,84 @@ class IDPSO_ELM_B():
         if(grafico == True):
             predicoes_vetor = [None] * len(stream)
             erro_stream_vetor = [None] * len(stream)
-            
+        
         #variavel auxiliar 
         mudanca_ocorreu = False
-        
+            
         #entrando no stream de dados
         for i in range(1, len(stream)):
-            
+
             #computando o erro
             loss = mean_absolute_error(stream[i:i+1], predicao)
             erro_stream += loss
-                
+    
             #adicionando o novo dado a janela de predicao
             janela_predicao.Add_janela(stream[i])
                 
             #realizando a nova predicao com a nova janela de predicao
-            predicao = enxame.Predizer(janela_predicao.dados)
-                
+            predicao = ELM.Predizer(janela_predicao.dados)
+
             if(grafico == True):                
                 #salvando o erro 
                 erro_stream_vetor[i] = loss
                 #salvando a predicao
                 predicoes_vetor[i] = predicao
-            
+                
             if(mudanca_ocorreu == False):
+                    
+                #monitorando o erro
+                string_ddm = ddm.monitorar(loss, i)
                 
-                #computando o comportamento para a janela de predicao, para somente uma instancia - media e desvio padrão
-                mudou = b.monitorar(janela_predicao.dados, stream[i:i+1], enxame, i)
-                
-                if(mudou == True):
+                #verificar se houve mudanca
+                if(string_ddm == ddm.alerta):
                     if(grafico == True):
-                        print("[%d] Detectou uma mudança" % (i))
+                        print("[%d] Alarme" % (i))
+                    alarmes.append(i)
+                    
+                #procedimento pos mudanca
+                if(string_ddm == ddm.mudanca):
+                    if(grafico == True):
+                        print("[%d] Detectou uma mudanca" % (i))
                     deteccoes.append(i)
                     
                     #zerando a janela de treinamento
                     janela_caracteristicas.Zerar_Janela()
-                    
-                    #variavel para alterar o fluxo, ir para o periodo de retreinamento
+                
                     mudanca_ocorreu = True
-                    
+            
             else:
                 
                 if(len(janela_caracteristicas.dados) < self.n):
-                  
+                    
                     #adicionando a nova instancia na janela de caracteristicas
                     janela_caracteristicas.Increment_Add(stream[i])
-                    
+                            
                 else:
                     
                     #atualizando o enxame_vigente preditivo
-                    enxame = IDPSO_ELM(janela_caracteristicas.dados, divisao_dataset, self.lags, self.qtd_neuronios)
-                    enxame.Parametros_IDPSO(it, self.numero_particulas, inercia_inicial, inercia_final, c1, c2, xmax, crit_parada)
-                    enxame.Treinar() 
+                    ELM = ELMRegressor(self.qtd_neuronios)
+                    ELM.Tratamento_dados(janela_caracteristicas.dados, divisao_dataset, self.lags)
+                    ELM.Treinar(ELM.train_entradas, ELM.train_saidas)
                     
-                    #ajustando com os dados finais do treinamento a janela de predicao
+                    #ajustando a janela de previsao
                     janela_predicao = Janela()
-                    janela_predicao.Ajustar(enxame.dataset[0][(len(enxame.dataset[0])-1):])
-                    predicao = enxame.Predizer(janela_predicao.dados)
-                    
-                    # atualizando o conceito para a caracteristica de comportamento
-                    b = B(self.limite, self.w, self.c)
-                    b.armazenar_conceito(janela_caracteristicas.dados, self.lags, enxame)
+                    janela_predicao.Ajustar(ELM.train_entradas[len(ELM.train_entradas)-1:])
+                    predicao = ELM.Predizer(janela_predicao.dados)
+                        
+                    #atualizar por ECDD
+                    [erro_min, desvio_min, erros] = self.Computar_estatisticas_DDM_desvio(janela_caracteristicas.dados, self.lags, ELM)
+                    ddm = DDM(self.w, self.c)
+                    ddm.armazenar_conceito(erro_min, desvio_min, erros)
                     
                     #variavel para voltar para o loop principal
                     mudanca_ocorreu = False
-                    
+        
         #variavel para armazenar o tempo final
         end_time = time.time()
         
         #computando as metricas de deteccao
         mt = Metricas_deteccao()
-        [falsos_alarmes, atrasos] = mt.resultados(stream, deteccoes, self.n)
-      
+        [falsos_alarmes, atrasos] = mt.resultados(stream, deteccoes, self.n)   
         #computando a acuracia da previsao ao longo do fluxo de dados
         MAE = erro_stream/len(stream)
         
@@ -184,7 +201,7 @@ class IDPSO_ELM_B():
         tempo_execucao = (end_time-start_time)
         
         if(grafico == True):
-            tecnica = "IDPSO_ELM_B"
+            tecnica = "ELM-DDM"
             print(tecnica)
             print("Alarmes:")
             print(alarmes)
@@ -199,7 +216,7 @@ class IDPSO_ELM_B():
         if(grafico == True):
             g = Grafico()
             g.Plotar_graficos(stream, predicoes_vetor, deteccoes, alarmes, erro_stream_vetor, self.n, atrasos, falsos_alarmes, tempo_execucao, MAE, nome=tecnica)
-            
+                           
         #retorno do metodo
         return falsos_alarmes, atrasos, MAE, tempo_execucao
     
@@ -207,20 +224,17 @@ def main():
     
     #instanciando o dataset
     dtst = Datasets('dentro')
-    #dataset = dtst.Leitura_dados(dtst.bases_linear_graduais(1), csv=True)
     dataset = dtst.Leitura_dados(dtst.bases_reais(3), csv=True)
     particao = Particionar_series(dataset, [0.0, 0.0, 0.0], 0)
     dataset = particao.Normalizar(dataset)
-        
+    
     #instanciando o algoritmo com sensores
     n = 300
     lags = 5
     qtd_neuronios = 10 
-    numero_particulas = 30
-    limite = 10
-    w = 0.75
-    c = 1
-    alg = IDPSO_ELM_B(dataset, n, lags, qtd_neuronios, numero_particulas, limite, w, c)
+    w = 8
+    c = 8
+    alg = ELM_DDM(dataset, n, lags, qtd_neuronios, w, c)
     
     #colhendo os resultados
     alg.Executar(grafico=True)
